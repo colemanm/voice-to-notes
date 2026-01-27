@@ -33,7 +33,7 @@ FFMPEG_BIN="${FFMPEG_BIN:-$(command -v ffmpeg || echo /opt/homebrew/bin/ffmpeg)}
 
 # Obsidian vault paths
 OBSIDIAN_VAULT="$HOME/Documents/Mem3x"
-VOICE_MEMOS_DIR="$OBSIDIAN_VAULT/Voice Memos"
+VOICE_MEMOS_DIR="$OBSIDIAN_VAULT/Voice Notes"
 DAILY_NOTES_DIR="$OBSIDIAN_VAULT/Journal"
 
 # Audio archive (final renamed MP3s)
@@ -199,7 +199,7 @@ append_to_daily_note() {
   {
     echo ""; echo "---"; echo ""
     echo "### Voice Memo: $(date '+%H:%M')"
-    echo "[[Voice Memos/${slug}|${title}]]"
+    echo "[[Voice Notes/${slug}|${title}]]"
     echo "> ${summary}"
   } >> "$daily_note"
 }
@@ -263,8 +263,8 @@ for input in "$@"; do
   # Git commit (if vault is a git repo)
   cd "$OBSIDIAN_VAULT"
   if [[ -d ".git" ]]; then
-    git add "Voice Memos/${md_file:t}" "${DAILY_NOTES_DIR#$OBSIDIAN_VAULT/}/${today}.md" 2>/dev/null || true
-    git commit -m "Voice memo: ${title}" 2>/dev/null || true
+    git add "Voice Notes/${md_file:t}" "${DAILY_NOTES_DIR#$OBSIDIAN_VAULT/}/${today}.md" 2>/dev/null || true
+    git commit -m "Voice note: ${title}" 2>/dev/null || true
     git push origin main 2>/dev/null || true
   fi
 
