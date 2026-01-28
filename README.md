@@ -24,6 +24,27 @@ Transcribes voice memos using Google Gemini and creates Obsidian notes with auto
 
 3. Configure paths in `voicenote.sh` if needed (Obsidian vault location, audio archive directory, etc.)
 
+## macOS Automator Setup
+
+Create a Quick Action to process voice memos directly from Finder:
+
+1. Open **Automator** and create a new **Quick Action**
+2. Set workflow to receive **files or folders** in **Finder**
+3. Add a **Run Shell Script** action with these settings:
+   - Shell: `/bin/zsh`
+   - Pass input: **as arguments**
+   - Replace the script content with:
+     ```bash
+     export GEMINI_API_KEY="your-api-key-here"
+     /path/to/voice-to-notes/voicenote.sh "$@"
+     ```
+   - Replace `your-api-key-here` with your actual API key
+   - Replace `/path/to/voice-to-notes/` with the actual path to this directory
+4. Save as "Process Voice Memo" (or any name you prefer)
+5. Right-click any audio file in Finder → **Quick Actions** → **Process Voice Memo**
+
+**Note:** For Automator, you may want to hardcode the API key directly in the script (as noted in `voicenote.sh`) instead of relying on `.env` file loading.
+
 ## Usage
 
 Run the script with audio file(s) as arguments:
