@@ -93,7 +93,7 @@ unique_file() {
 # Upload file to Gemini and get file URI
 gemini_upload_file() {
   local audio_path="$1"
-  local mime_type num_bytes upload_url file_uri
+  local mime_type num_bytes upload_url file_uri file_name
 
   mime_type=$(file -b --mime-type "$audio_path")
   num_bytes=$(wc -c < "$audio_path" | tr -d ' ')
@@ -113,7 +113,10 @@ gemini_upload_file() {
   upload_url=$(grep -i "x-goog-upload-url: " "$header_file" | cut -d" " -f2 | tr -d "\r")
   rm -f "$header_file"
 
-  [[ -z "$upload_url" ]] && return 1
+  if [[ -z "$upload_url" ]]; then
+    log "Upload failed: no upload URL received"
+    return 0
+  fi
 
   local file_info=$(mktemp)
   curl -s "$upload_url" \
@@ -123,7 +126,29 @@ gemini_upload_file() {
     --data-binary "@${audio_path}" > "$file_info"
 
   file_uri=$(jq -r '.file.uri // empty' "$file_info" 2>/dev/null)
+  file_name=$(jq -r '.file.name // empty' "$file_info" 2>/dev/null)
+  if [[ -z "$file_uri" ]]; then
+    log "Upload response: $(cat "$file_info")"
+    rm -f "$file_info"
+    return 0
+  fi
   rm -f "$file_info"
+
+  # Wait for file to become ACTIVE (processing can take a few seconds)
+  if [[ -n "$file_name" ]]; then
+    local state="PROCESSING" attempts=0
+    while [[ "$state" == "PROCESSING" && "$attempts" -lt 12 ]]; do
+      sleep 5
+      state=$(curl -s "https://generativelanguage.googleapis.com/v1beta/${file_name}" \
+        -H "x-goog-api-key: $GEMINI_API_KEY" | jq -r '.state // "ACTIVE"')
+      attempts=$((attempts + 1))
+    done
+    if [[ "$state" != "ACTIVE" ]]; then
+      log "File not ready after polling, state: $state"
+      return 0
+    fi
+  fi
+
   print -r -- "$file_uri"
 }
 
@@ -145,8 +170,13 @@ gemini_transcribe() {
       }]
     }" > "$response"
 
-  jq -r '.candidates[0].content.parts[0].text // empty' "$response" 2>/dev/null
+  local text
+  text=$(jq -r '.candidates[0].content.parts[0].text // empty' "$response" 2>/dev/null)
+  if [[ -z "$text" ]]; then
+    log "Transcription API response: $(cat "$response")"
+  fi
   rm -f "$response"
+  print -r -- "$text"
 }
 
 # Generate title, summary, and tags
@@ -167,8 +197,13 @@ gemini_analyze() {
       }]
     }')" > "$response"
 
-  jq -r '.candidates[0].content.parts[0].text // empty' "$response" 2>/dev/null
+  local text
+  text=$(jq -r '.candidates[0].content.parts[0].text // empty' "$response" 2>/dev/null)
+  if [[ -z "$text" ]]; then
+    log "Analyze API response: $(cat "$response")"
+  fi
   rm -f "$response"
+  print -r -- "$text"
 }
 
 # Ensure daily note exists
@@ -178,7 +213,7 @@ ensure_daily_note() {
 
   if [[ ! -f "$daily_note" ]]; then
     cd "$OBSIDIAN_VAULT"
-    command -v claude >/dev/null && echo "/daily" | claude --print 2>/dev/null || true
+    command -v claude >/dev/null && echo "/daily" | claude --print >/dev/null 2>&1 || true
 
     [[ ! -f "$daily_note" ]] && cat > "$daily_note" << EOF
 ---
