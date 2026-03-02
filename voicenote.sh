@@ -90,6 +90,20 @@ unique_file() {
   fi
 }
 
+FAILED_QUEUE="$LOG_ROOT/failed-queue.txt"
+
+retry() {
+  local attempt delays=(5 15 30)
+  for attempt in 1 2 3; do
+    "$@" && return 0 || true
+    if [[ "$attempt" -lt 3 ]]; then
+      log "Attempt $attempt failed, retrying in ${delays[$attempt]}s..."
+      sleep "${delays[$attempt]}"
+    fi
+  done
+  return 1
+}
+
 # Upload file to Gemini and get file URI
 gemini_upload_file() {
   local audio_path="$1"
@@ -100,7 +114,7 @@ gemini_upload_file() {
 
   local header_file=$(mktemp)
 
-  curl -s "https://generativelanguage.googleapis.com/upload/v1beta/files" \
+  curl -s --connect-timeout 10 --max-time 120 "https://generativelanguage.googleapis.com/upload/v1beta/files" \
     -H "x-goog-api-key: $GEMINI_API_KEY" \
     -D "$header_file" \
     -H "X-Goog-Upload-Protocol: resumable" \
@@ -115,11 +129,11 @@ gemini_upload_file() {
 
   if [[ -z "$upload_url" ]]; then
     log "Upload failed: no upload URL received"
-    return 0
+    return 1
   fi
 
   local file_info=$(mktemp)
-  curl -s "$upload_url" \
+  curl -s --connect-timeout 10 --max-time 120 "$upload_url" \
     -H "Content-Length: ${num_bytes}" \
     -H "X-Goog-Upload-Offset: 0" \
     -H "X-Goog-Upload-Command: upload, finalize" \
@@ -130,7 +144,7 @@ gemini_upload_file() {
   if [[ -z "$file_uri" ]]; then
     log "Upload response: $(cat "$file_info")"
     rm -f "$file_info"
-    return 0
+    return 1
   fi
   rm -f "$file_info"
 
@@ -139,13 +153,13 @@ gemini_upload_file() {
     local state="PROCESSING" attempts=0
     while [[ "$state" == "PROCESSING" && "$attempts" -lt 12 ]]; do
       sleep 5
-      state=$(curl -s "https://generativelanguage.googleapis.com/v1beta/${file_name}" \
+      state=$(curl -s --connect-timeout 10 --max-time 120 "https://generativelanguage.googleapis.com/v1beta/${file_name}" \
         -H "x-goog-api-key: $GEMINI_API_KEY" | jq -r '.state // "ACTIVE"')
       attempts=$((attempts + 1))
     done
     if [[ "$state" != "ACTIVE" ]]; then
       log "File not ready after polling, state: $state"
-      return 0
+      return 1
     fi
   fi
 
@@ -157,7 +171,7 @@ gemini_transcribe() {
   local file_uri="$1" mime_type="$2"
   local response=$(mktemp)
 
-  curl -s "https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent" \
+  curl -s --connect-timeout 10 --max-time 120 "https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent" \
     -H "x-goog-api-key: $GEMINI_API_KEY" \
     -H "Content-Type: application/json" \
     -X POST \
@@ -174,6 +188,8 @@ gemini_transcribe() {
   text=$(jq -r '.candidates[0].content.parts[0].text // empty' "$response" 2>/dev/null)
   if [[ -z "$text" ]]; then
     log "Transcription API response: $(cat "$response")"
+    rm -f "$response"
+    return 1
   fi
   rm -f "$response"
   print -r -- "$text"
@@ -185,7 +201,7 @@ gemini_analyze() {
   local excerpt="${transcript:0:8000}"
   local response=$(mktemp)
 
-  curl -s "https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent" \
+  curl -s --connect-timeout 10 --max-time 120 "https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent" \
     -H "x-goog-api-key: $GEMINI_API_KEY" \
     -H "Content-Type: application/json" \
     -X POST \
@@ -201,6 +217,8 @@ gemini_analyze() {
   text=$(jq -r '.candidates[0].content.parts[0].text // empty' "$response" 2>/dev/null)
   if [[ -z "$text" ]]; then
     log "Analyze API response: $(cat "$response")"
+    rm -f "$response"
+    return 1
   fi
   rm -f "$response"
   print -r -- "$text"
@@ -239,38 +257,37 @@ append_to_daily_note() {
   } >> "$daily_note"
 }
 
-# ----- main loop -----
-for input in "$@"; do
-  [[ -d "$input" ]] && continue
-  case "${input:l}" in
-    *.m4a|*.mp3|*.wav|*.aac) ;;
-    *) continue ;;
-  esac
-
-  wait_stable "$input"
-
-  base="${input:t}"; stem="${base%.*}"; ext="${base##*.}"
-  timestamp="$(date +"%Y-%m-%dT%H:%M:%S%z")"
-  today="$(date +%Y-%m-%d)"
-  time_slug="$(date +%Y%m%d-%H%M%S)"
-
-  log "Processing: $base"
-
-  # Convert to MP3 with datestamp name
-  mp3_file="$AUDIO_DIR/voice-memo-${time_slug}.mp3"
-  [[ "${input:l}" == *.mp3 ]] && cp "$input" "$mp3_file" || \
-    "$FFMPEG_BIN" -y -i "$input" "${MP3_OPTS[@]}" "$mp3_file"
+# ----- helper: process a single MP3 file -----
+process_mp3() {
+  local mp3_file="$1"
+  local timestamp="$(date +"%Y-%m-%dT%H:%M:%S%z")"
+  local today="$(date +%Y-%m-%d)"
+  local time_slug="$(date +%Y%m%d-%H%M%S)"
 
   # Upload and transcribe
+  local mime_type file_uri transcript ai_out title slug summary
+  local _retry_out
   mime_type=$(file -b --mime-type "$mp3_file")
-  file_uri=$(gemini_upload_file "$mp3_file")
-  [[ -z "$file_uri" ]] && { log "Upload failed"; continue; }
 
-  transcript=$(gemini_transcribe "$file_uri" "$mime_type")
-  [[ -z "$transcript" ]] && { log "Transcription failed"; continue; }
+  _retry_out=$(mktemp)
+  retry gemini_upload_file "$mp3_file" > "$_retry_out" || true
+  file_uri=$(cat "$_retry_out"); rm -f "$_retry_out"
+  if [[ -z "$file_uri" ]]; then
+    log "Upload failed after 3 attempts: ${mp3_file:t}"
+    return 1
+  fi
 
-  # Analyze
-  ai_out=$(gemini_analyze "$transcript")
+  _retry_out=$(mktemp)
+  retry gemini_transcribe "$file_uri" "$mime_type" > "$_retry_out" || true
+  transcript=$(cat "$_retry_out"); rm -f "$_retry_out"
+  if [[ -z "$transcript" ]]; then
+    log "Transcription failed after 3 attempts: ${mp3_file:t}"
+    return 1
+  fi
+
+  _retry_out=$(mktemp)
+  retry gemini_analyze "$transcript" > "$_retry_out" || true
+  ai_out=$(cat "$_retry_out"); rm -f "$_retry_out"
   title=$(echo "$ai_out" | sed -n 's/^TITLE:[[:space:]]*//Ip' | head -1)
   slug=$(sanitize_slug "$(echo "$ai_out" | sed -n 's/^SLUG:[[:space:]]*//Ip' | head -1)")
   summary=$(echo "$ai_out" | sed -n 's/^SUMMARY:[[:space:]]*//Ip' | head -1)
@@ -279,6 +296,7 @@ for input in "$@"; do
   [[ -z "$slug" ]] && slug="voice-memo-${time_slug}"
 
   # Create note
+  local md_file
   md_file=$(unique_file "$VOICE_MEMOS_DIR/${slug}.md")
   {
     echo "---"
@@ -304,6 +322,66 @@ for input in "$@"; do
   fi
 
   log "Done: ${md_file:t}"
+}
+
+# ----- build processing list: failed queue + new args -----
+mp3_queue=()
+
+# Prepend previously failed files
+if [[ -f "$FAILED_QUEUE" ]]; then
+  while IFS= read -r queued_mp3; do
+    [[ -f "$queued_mp3" ]] && mp3_queue+=("$queued_mp3")
+  done < "$FAILED_QUEUE"
+  if [[ ${#mp3_queue[@]} -gt 0 ]]; then
+    log "Retrying ${#mp3_queue[@]} previously failed file(s)"
+  fi
+fi
+
+# ----- convert new input files to MP3 and add to queue -----
+for input in "$@"; do
+  [[ -d "$input" ]] && continue
+  case "${input:l}" in
+    *.m4a|*.mp3|*.wav|*.aac) ;;
+    *) continue ;;
+  esac
+
+  wait_stable "$input"
+
+  local_time_slug="$(date +%Y%m%d-%H%M%S)"
+  log "Processing: ${input:t}"
+
+  mp3_file="$AUDIO_DIR/voice-memo-${local_time_slug}.mp3"
+  [[ "${input:l}" == *.mp3 ]] && cp "$input" "$mp3_file" || \
+    "$FFMPEG_BIN" -y -i "$input" "${MP3_OPTS[@]}" "$mp3_file"
+
+  mp3_queue+=("$mp3_file")
 done
+
+# ----- process all queued MP3s -----
+new_failures=()
+for mp3_file in ${mp3_queue[@]+"${mp3_queue[@]}"}; do
+  log "Processing MP3: ${mp3_file:t}"
+  if process_mp3 "$mp3_file"; then
+    # Success — remove from failed queue if it was there
+    if [[ -f "$FAILED_QUEUE" ]]; then
+      grep -vxF "$mp3_file" "$FAILED_QUEUE" > "${FAILED_QUEUE}.tmp" 2>/dev/null || true
+      mv "${FAILED_QUEUE}.tmp" "$FAILED_QUEUE"
+    fi
+  else
+    # Failure — queue for next run and notify
+    new_failures+=("$mp3_file")
+    osascript -e 'display notification "Voice note failed to transcribe (will retry next run)" with title "Voice Note Pipeline" sound name "Basso"' 2>/dev/null || true
+  fi
+done
+
+# Write any new failures to the queue (preserving existing entries)
+for f in ${new_failures[@]+"${new_failures[@]}"}; do
+  grep -qxF "$f" "$FAILED_QUEUE" 2>/dev/null || echo "$f" >> "$FAILED_QUEUE"
+done
+
+# Clean up empty queue file
+if [[ -f "$FAILED_QUEUE" ]] && [[ ! -s "$FAILED_QUEUE" ]]; then
+  rm -f "$FAILED_QUEUE"
+fi
 
 echo "[DONE] $(date '+%Y-%m-%dT%H:%M:%S')"
