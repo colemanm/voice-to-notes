@@ -40,7 +40,7 @@ DAILY_NOTES_DIR="$OBSIDIAN_VAULT/Journal"
 AUDIO_DIR="$HOME/Documents/Voice Notes"
 
 # Gemini model
-GEMINI_MODEL="gemini-3-flash-preview"
+GEMINI_MODEL="gemini-2.5-flash"
 
 MP3_OPTS=(-vn -acodec libmp3lame -q:a 2)
 
