@@ -297,7 +297,7 @@ process_mp3() {
 
   # Create note
   local md_file
-  md_file=$(unique_file "$VOICE_MEMOS_DIR/${slug}.md")
+  md_file=$(unique_file "$VOICE_MEMOS_DIR/${today} ${slug}.md")
   {
     echo "---"
     echo "title: \"$title\""
